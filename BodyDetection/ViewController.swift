@@ -25,21 +25,19 @@ class ViewController: UIViewController, ARSessionDelegate {
     let characterOffset: SIMD3<Float> = [-1.0, 0, 0] // Offset the character by one meter to the left
     let characterAnchor = AnchorEntity()
     
-    // MARK: - Recording Properties
-    var recordedFrames: [RecordedFrame] = []
-    var isRecording = false
-    var recordingStartTime: TimeInterval = 0
+    // MARK: - Single Frame Capture Properties
+    var capturedFrame: RecordedFrame?
     
     // MARK: - UI Elements
-    private lazy var recordButton: UIButton = {
+    private lazy var captureButton: UIButton = {
         let button = UIButton(type: .system)
-        button.setTitle("Start Recording", for: .normal)
+        button.setTitle("Capture Frame", for: .normal)
         button.titleLabel?.font = UIFont.boldSystemFont(ofSize: 18)
         button.backgroundColor = UIColor.systemBlue
         button.setTitleColor(.white, for: .normal)
         button.layer.cornerRadius = 8
         button.contentEdgeInsets = UIEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
-        button.addTarget(self, action: #selector(recordButtonTapped), for: .touchUpInside)
+        button.addTarget(self, action: #selector(captureButtonTapped), for: .touchUpInside)
         button.translatesAutoresizingMaskIntoConstraints = false
         return button
     }()
@@ -48,8 +46,8 @@ class ViewController: UIViewController, ARSessionDelegate {
         super.viewDidAppear(animated)
         arView.session.delegate = self
         
-        // Setup recording button
-        setupRecordButton()
+        // Setup capture button
+        setupCaptureButton()
         
         // If the iOS device doesn't support body tracking, raise a developer error for
         // this unhandled case.
@@ -102,224 +100,166 @@ class ViewController: UIViewController, ARSessionDelegate {
                 characterAnchor.addChild(character)
             }
             
-            // MARK: - Part 2: Capture skeleton joints frame by frame
-            if isRecording {
-                captureSkeletonFrame(bodyAnchor: bodyAnchor)
-            }
+            // No need to capture frames continuously anymore
+            // We'll capture only when button is pressed
         }
     }
     
-    // MARK: - Recording Setup and Actions
-    private func setupRecordButton() {
-        view.addSubview(recordButton)
+    // MARK: - Single Frame Capture Setup and Actions
+    private func setupCaptureButton() {
+        view.addSubview(captureButton)
         
         NSLayoutConstraint.activate([
-            recordButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            recordButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40)
+            captureButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            captureButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -40)
         ])
     }
     
-    @objc private func recordButtonTapped() {
-        if isRecording {
-            stopRecording()
-        } else {
-            startRecording()
-        }
+    @objc private func captureButtonTapped() {
+        captureSingleFrame()
     }
     
-    private func startRecording() {
-        isRecording = true
-        recordingStartTime = CACurrentMediaTime()
-        recordedFrames.removeAll()
-        
-        recordButton.setTitle("Stop Recording", for: .normal)
-        recordButton.backgroundColor = UIColor.systemRed
-        
-        print("🔴 Started recording skeleton data...")
-        
-        // SIMULATOR TESTING: Add fake data since body tracking doesn't work in simulator
+    private func captureSingleFrame() {
+        // Check if running in simulator
         #if targetEnvironment(simulator)
-        print("⚠️ Running in simulator - will generate test data for playback")
-        generateTestFrames()
-        #endif
-    }
-    
-    private func stopRecording() {
-        isRecording = false
-        
-        recordButton.setTitle("Start Recording", for: .normal)
-        recordButton.backgroundColor = UIColor.systemBlue
-        
-        print("🔴 Stopped recording. Captured \(recordedFrames.count) frames")
-        
-        // Debug: Print some frame data
-        if let firstFrame = recordedFrames.first {
-            print("First frame joints: \(firstFrame.jointTransforms.keys)")
-            for (joint, transform) in firstFrame.jointTransforms {
-                let position = simd_make_float3(transform.columns.3)
-                print("  \(joint): \(position)")
-            }
+        // Generate test data for simulator
+        let testFrame = generateTestFrame()
+        capturedFrame = testFrame
+        print("📸 Generated test frame for simulator with \(testFrame.jointTransforms.count) joints")
+        #else
+        // Find the current body anchor
+        guard let session = arView.session.currentFrame,
+              let bodyAnchor = session.anchors.compactMap({ $0 as? ARBodyAnchor }).first else {
+            showAlert(title: "No Body Detected", message: "Please make sure your full body is visible to the camera.")
+            return
         }
         
-        // MARK: - Part 3: Transition to playback screen
-        print("🔄 Attempting to show playback...")
-        showRecordedSkeletonPlayback()
+        // Capture the current frame
+        let currentTime = CACurrentMediaTime()
+        let jointTransforms = captureJointTransforms(from: bodyAnchor)
+        
+        capturedFrame = RecordedFrame(timestamp: currentTime, jointTransforms: jointTransforms)
+        
+        print("📸 Captured single frame with \(jointTransforms.count) joints")
+        #endif
+        
+        // Show success feedback
+        captureButton.setTitle("Frame Captured!", for: .normal)
+        captureButton.backgroundColor = UIColor.systemGreen
+        
+        // Reset button after 1 second
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            self.captureButton.setTitle("Capture Frame", for: .normal)
+            self.captureButton.backgroundColor = UIColor.systemBlue
+        }
+        
+        // Navigate to joint details screen
+        showJointDetails()
     }
     
-        // MARK: - Part 2: Capture skeleton joints
-    private func captureSkeletonFrame(bodyAnchor: ARBodyAnchor) {
-        let currentTime = CACurrentMediaTime() - recordingStartTime
-        
-        // Record the basic body joints that are actually available in ARSkeleton.JointName
-        let relevantJoints: [ARSkeleton.JointName] = [
+    // MARK: - Joint Capture and Analysis
+    private func captureJointTransforms(from bodyAnchor: ARBodyAnchor) -> [ARSkeleton.JointName: simd_float4x4] {
+        // Capture all available joints from the skeleton
+        let allJoints: [ARSkeleton.JointName] = [
             // Core body joints
             .root,
             
-            // Arms
+            // Head and neck
+            .head,
+            
+            // Arms and hands
             .leftShoulder,
             .leftHand,
             .rightShoulder,
             .rightHand,
             
-            // Legs
+            // Legs and feet
             .leftFoot,
-            .rightFoot,
-            
-            // Head
-            .head
+            .rightFoot
         ]
         
         var jointTransforms: [ARSkeleton.JointName: simd_float4x4] = [:]
         
-        for jointName in relevantJoints {
+        for jointName in allJoints {
             let jointTransform = bodyAnchor.skeleton.modelTransform(for: jointName)
             jointTransforms[jointName] = jointTransform
         }
         
-        let frame = RecordedFrame(timestamp: currentTime, jointTransforms: jointTransforms)
-        recordedFrames.append(frame)
-        
-        // Debug: Print every 30 frames (about twice per second at 60fps)
-        if recordedFrames.count % 30 == 0 {
-            print("📹 Captured \(recordedFrames.count) frames...")
-        }
+        return jointTransforms
     }
     
-    // MARK: - Part 3: Show playback
-    private func showRecordedSkeletonPlayback() {
-        print("🎬 showRecordedSkeletonPlayback called with \(recordedFrames.count) frames")
-        
-        guard !recordedFrames.isEmpty else {
-            print("❌ No recorded frames to show playback")
-            
-            // Show an alert to inform the user
-            let alert = UIAlertController(title: "No Recording", 
-                                        message: "No skeleton data was recorded. Make sure you are visible to the camera and your full body is detected.", 
-                                        preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alert, animated: true)
+    private func showJointDetails() {
+        guard let frame = capturedFrame else {
+            showAlert(title: "No Frame Captured", message: "Please capture a frame first.")
             return
         }
         
-        // Show playback mode selection
-        showPlaybackModeSelection()
+        let jointDetailsVC = JointDetailsViewController(capturedFrame: frame)
+        jointDetailsVC.modalPresentationStyle = .fullScreen
+        present(jointDetailsVC, animated: true)
     }
     
-    private func showPlaybackModeSelection() {
-        let alert = UIAlertController(title: "Choose Playback Mode", 
-                                    message: "Select how you want to view the recorded motion:", 
-                                    preferredStyle: .alert)
-        
-        // RealityKit option - skeleton visualization
-        alert.addAction(UIAlertAction(title: "Skeleton View (RealityKit)", style: .default) { _ in
-            print("✅ Creating RealityKit PlaybackViewController...")
-            let playbackVC = PlaybackViewController(recordedFrames: self.recordedFrames)
-            playbackVC.modalPresentationStyle = .fullScreen
-            
-            print("🚀 Presenting RealityKit PlaybackViewController...")
-            self.present(playbackVC, animated: true) {
-                print("✅ RealityKit PlaybackViewController presented successfully")
-            }
-        })
-        
-        // SceneKit option - robot character animation
-        alert.addAction(UIAlertAction(title: "Robot Animation (SceneKit)", style: .default) { _ in
-            print("✅ Creating SceneKit PlaybackViewController...")
-            let sceneKitPlaybackVC = SceneKitPlaybackViewController()
-            sceneKitPlaybackVC.modalPresentationStyle = .fullScreen
-            
-            print("🚀 Presenting SceneKit PlaybackViewController...")
-            self.present(sceneKitPlaybackVC, animated: true) {
-                print("✅ SceneKit PlaybackViewController presented successfully")
-            }
-        })
-        
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
+    private func showAlert(title: String, message: String) {
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }
     
     // MARK: - Simulator Testing
     #if targetEnvironment(simulator)
-    private func generateTestFrames() {
-        // Generate test frames for simulator testing
-        let frameCount = 120 // 2 seconds at 60fps
+    private func generateTestFrame() -> RecordedFrame {
+        let currentTime = CACurrentMediaTime()
+        var jointTransforms: [ARSkeleton.JointName: simd_float4x4] = [:]
         
-        for i in 0..<frameCount {
-            let timestamp = Double(i) / 60.0 // 60fps
-            var jointTransforms: [ARSkeleton.JointName: simd_float4x4] = [:]
-            
-            // Create animated test poses
-            let time = Float(timestamp)
-            let waveHeight = sin(time * 2.0) * 0.3
-            
-            // Root - center position
-            jointTransforms[.root] = simd_float4x4(
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, waveHeight, 0, 1]
-            )
-            
-            // Left shoulder
-            jointTransforms[.leftShoulder] = simd_float4x4(
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [-0.3, waveHeight + 0.3, 0, 1]
-            )
-            
-            // Right shoulder
-            jointTransforms[.rightShoulder] = simd_float4x4(
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0.3, waveHeight + 0.3, 0, 1]
-            )
-            
-            // Left hand - animated up and down
-            let leftHandY = waveHeight + 0.1 + sin(time * 3.0) * 0.2
-            jointTransforms[.leftHand] = simd_float4x4(
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [-0.5, leftHandY, 0, 1]
-            )
-            
-            // Right hand - animated up and down (opposite phase)
-            let rightHandY = waveHeight + 0.1 + sin(time * 3.0 + Float.pi) * 0.2
-            jointTransforms[.rightHand] = simd_float4x4(
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0.5, rightHandY, 0, 1]
-            )
-            
-            let frame = RecordedFrame(timestamp: timestamp, jointTransforms: jointTransforms)
-            recordedFrames.append(frame)
+        // Create realistic joint positions for a standing pose
+        let allJoints: [ARSkeleton.JointName] = [
+            .root, .head,
+            .leftShoulder, .leftHand, .rightShoulder, .rightHand,
+            .leftFoot, .rightFoot
+        ]
+        
+        for joint in allJoints {
+            let transform = generateTestTransform(for: joint)
+            jointTransforms[joint] = transform
         }
         
-        print("📱 Generated \(recordedFrames.count) test frames for simulator")
+        return RecordedFrame(timestamp: currentTime, jointTransforms: jointTransforms)
+    }
+    
+    private func generateTestTransform(for joint: ARSkeleton.JointName) -> simd_float4x4 {
+        // Generate realistic positions for different joints
+        let position: SIMD3<Float>
+        let rotation = simd_quatf(angle: Float.random(in: -0.1...0.1), axis: SIMD3<Float>(0, 1, 0))
+        
+        switch joint {
+        case .root:
+            position = SIMD3<Float>(0, 0, 0)
+        case .head:
+            position = SIMD3<Float>(0, 1.7, 0)
+        case .leftShoulder:
+            position = SIMD3<Float>(-0.4, 1.4, 0)
+        case .rightShoulder:
+            position = SIMD3<Float>(0.4, 1.4, 0)
+        case .leftHand:
+            position = SIMD3<Float>(-0.7, 1.0, 0.2)
+        case .rightHand:
+            position = SIMD3<Float>(0.7, 1.0, 0.2)
+        case .leftFoot:
+            position = SIMD3<Float>(-0.15, 0, 0)
+        case .rightFoot:
+            position = SIMD3<Float>(0.15, 0, 0)
+        default:
+            position = SIMD3<Float>(0, 0, 0)
+        }
+        
+        // Create transform matrix
+        let rotationMatrix = simd_float3x3(rotation)
+        return simd_float4x4(
+            SIMD4<Float>(rotationMatrix.columns.0, 0),
+            SIMD4<Float>(rotationMatrix.columns.1, 0),
+            SIMD4<Float>(rotationMatrix.columns.2, 0),
+            SIMD4<Float>(position, 1)
+        )
     }
     #endif
 }
